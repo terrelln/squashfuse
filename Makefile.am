@@ -50,10 +50,10 @@ endif
 # Low-level squashfuse_ll, if supported
 if SQ_WANT_LOWLEVEL
 bin_PROGRAMS += squashfuse_ll
-squashfuse_ll_SOURCES = ll.c ll_inode.c nonstd-daemon.c ll.h
+squashfuse_ll_SOURCES = ll.c ll_inode.c nonstd-daemon.c ll.h queue.c queue.h
 squashfuse_ll_CPPFLAGS = $(FUSE_CPPFLAGS)
 squashfuse_ll_LDADD = libsquashfuse.la libfuseprivate.la $(COMPRESSION_LIBS) \
-  $(FUSE_LIBS)
+  $(FUSE_LIBS) $(PTHREAD_LIBS)
 
 endif
 

@@ -47,6 +47,9 @@ AS_IF([test "x$sq_fuse_found" = xyes],[
 ])
 SQ_FUSE_RESULT
 
+# Pthread detection
+AX_PTHREAD
+
 # Misc
 SQ_CHECK_PROG_MAKE_EXPORT
 AC_CHECK_TYPE([__le16],[

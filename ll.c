@@ -24,11 +24,13 @@
  */
 #include "ll.h"
 #include "fuseprivate.h"
+#include "queue.h"
 
 #include "nonstd.h"
 
 #include <errno.h>
 #include <float.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +52,118 @@ static time_t last_access = 0;
 static sig_atomic_t open_refcount = 0;
 /* same as lib/fuse_signals.c */
 static struct fuse_session *fuse_instance = NULL;
+
+/* State required for the asynchronous kernel cache filling.
+ * We align reads to block boundaries and asynchronously push the prefix/suffix
+ * to the kernel caches.
+ */
+static pthread_t buf_queue_thread;
+static sqfs_queue buf_queue;
+static const size_t BUF_QUEUE_SIZE = 5;
+
+typedef struct {
+	size_t begin;
+	size_t end;
+	size_t block;
+} sqfs_range;
+
+typedef struct {
+	fuse_ino_t ino;
+	off_t off;
+	void* mem;
+	size_t count;
+	sqfs_range ranges[2];
+} sqfs_buf_entry;
+
+static bool sqfs_buf_entry_contains(void const *opaque, void const *value) {
+	sqfs_buf_entry const *entry = (sqfs_buf_entry const *)value;
+	sqfs_range const *range = (sqfs_range const *)opaque;
+	size_t i;
+
+	for (i = 0; i < entry->count; ++i) {
+		if (entry->ranges[i].block == range->block)
+			return true;
+	}
+	return false;
+}
+
+static sqfs_buf_entry sqfs_buf_entry_init(fuse_ino_t ino, off_t off,
+		char *buf) {
+	sqfs_buf_entry e = {
+		.ino = ino,
+		.off = off,
+		.mem = buf,
+		.count = 0,
+	};
+	return e;
+}
+
+static void sqfs_buf_entry_try_add(sqfs_buf_entry *e, size_t begin, size_t end,
+		size_t block_size, sqfs_queue *q) {
+	const sqfs_range r = {
+		.begin = begin,
+		.end = end,
+		.block = (e->off + begin) / block_size,
+	};
+	if (!sqfs_queue_find(q, &r, sqfs_buf_entry_contains))
+		e->ranges[e->count++] = r;
+}
+
+static void sqfs_buf_entry_destroy(void *v) {
+	sqfs_buf_entry *entry = (sqfs_buf_entry *)v;
+	if (entry)
+		free(entry->mem);
+}
+
+static sqfs_err sqfs_buf_queue_init(sqfs_queue *q, size_t size) {
+	return sqfs_queue_init(q, sizeof(sqfs_buf_entry), size,
+			sqfs_buf_entry_destroy);
+}
+
+static void sqfs_buf_entry_process(sqfs_buf_entry *e, struct fuse_chan *ch) {
+	size_t i;
+	for (i = 0; i < e->count; ++i) {
+		const size_t begin = e->ranges[i].begin;
+		const size_t size = e->ranges[i].end - begin;
+		const off_t off = e->off + begin;
+		struct fuse_bufvec buf = {
+			.count = 1,
+			.idx = 0,
+			.off = 0,
+		};
+		int err;
+
+		buf.buf[0].mem = (char *)e->mem + begin;
+		buf.buf[0].size = size;
+		err = fuse_lowlevel_notify_store(ch, e->ino, off, &buf, 0);
+		if (err == -ENODEV)
+			break;
+	}
+	sqfs_buf_entry_destroy(e);
+}
+
+static void *sqfs_buf_queue_process(void *arg) {
+	struct fuse_session *const se = (struct fuse_session *)arg;
+	struct fuse_chan *const ch = fuse_session_next_chan(se, NULL);
+	sqfs_buf_entry e;
+
+	while (sqfs_queue_pop(&buf_queue, &e))
+		sqfs_buf_entry_process(&e, ch);
+
+	return NULL;
+}
+
+void sqfs_start_buf_queue_thread(struct fuse_session *se) {
+	sqfs_buf_queue_init(&buf_queue, BUF_QUEUE_SIZE);
+	pthread_create(&buf_queue_thread, NULL, sqfs_buf_queue_process, se);
+
+}
+
+void sqfs_stop_buf_queue_thread() {
+	sqfs_queue_finish(&buf_queue);
+	pthread_join(buf_queue_thread, NULL);
+	sqfs_queue_destroy(&buf_queue);
+}
 
 static void sqfs_ll_op_getattr(fuse_req_t req, fuse_ino_t ino,
 		struct fuse_file_info *fi) {
@@ -255,25 +369,53 @@ static void sqfs_ll_op_read(fuse_req_t req, fuse_ino_t ino,
 	sqfs_ll *ll = fuse_req_userdata(req);
 	sqfs_inode *inode = (sqfs_inode*)(intptr_t)fi->fh;
 	sqfs_err err = SQFS_OK;
-	
+
+	size_t block_size;
+	size_t block_off;
+
 	off_t osize;
-	char *buf = malloc(size);
+	char *buf;
+	bool free_buf = true;
+
+	block_size = ll->fs.sb.block_size;
+	block_off = off % block_size;
+	osize = size + block_off;
+	if (osize % block_size)
+		osize += block_size - (osize % block_size);
+	off -= block_off;
+	buf = malloc(osize);
 	if (!buf) {
 		fuse_reply_err(req, ENOMEM);
 		return;
 	}
-	
+
 	last_access = time(NULL);
-	osize = size;
 	err = sqfs_read_range(&ll->fs, inode, off, &osize, buf);
 	if (err) {
 		fuse_reply_err(req, EIO);
-	} else if (osize == 0) { /* EOF */
+	} else if (osize <= block_off) { /* EOF */
 		fuse_reply_buf(req, NULL, 0);
 	} else {
-		fuse_reply_buf(req, buf, osize);
+		sqfs_buf_entry e = sqfs_buf_entry_init(ino, off, buf);
+		/* Add the prefix (if any) to the node. */
+		if (block_off > 0)
+			sqfs_buf_entry_try_add(&e, 0, block_off, block_size, &buf_queue);
+		/* Add the suffix (if any) to the node.
+		 * Resize osize to the original requested size. */
+		osize -= block_off;
+		if (osize > size) {
+			sqfs_buf_entry_try_add(&e, block_off + size, block_off + osize,
+					block_size, &buf_queue);
+			osize = size;
+		}
+		/* Push the entry to the queue and don't free buf. */
+		if (e.count > 0 && sqfs_queue_try_push(&buf_queue, &e))
+			free_buf = false;
+		/* Send the reply */
+		fuse_reply_buf(req, buf + block_off, osize);
 	}
-	free(buf);
+	if (free_buf)
+		free(buf);
 }
 
 static void sqfs_ll_op_readlink(fuse_req_t req, fuse_ino_t ino) {
@@ -536,7 +678,9 @@ int main(int argc, char *argv[]) {
 						}
 						fuse_session_add_chan(se, ch.ch);
 						/* FIXME: multithreading */
+						sqfs_start_buf_queue_thread(se);
 						err = fuse_session_loop(se);
+						sqfs_stop_buf_queue_thread();
 						teardown_idle_timeout();
 						fuse_remove_signal_handlers(se);
 						#if HAVE_DECL_FUSE_SESSION_REMOVE_CHAN
